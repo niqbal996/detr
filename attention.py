@@ -8,25 +8,25 @@ import torch
 from torch import nn
 from torchvision.models import resnet50
 import torchvision.transforms as T
+import argparse
+import datetime
+import json
+import random
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, DistributedSampler
+
+import datasets
+import util.misc as utils
+from datasets import build_dataset, get_coco_api_from_dataset
+from engine import evaluate, train_one_epoch
+from models import build_model
 torch.set_grad_enabled(False)
 
-# COCO classes
-CLASSES = [
-    'N/A', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
-    'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'N/A',
-    'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse',
-    'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'N/A', 'backpack',
-    'umbrella', 'N/A', 'N/A', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis',
-    'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove',
-    'skateboard', 'surfboard', 'tennis racket', 'bottle', 'N/A', 'wine glass',
-    'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich',
-    'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake',
-    'chair', 'couch', 'potted plant', 'bed', 'N/A', 'dining table', 'N/A',
-    'N/A', 'toilet', 'N/A', 'tv', 'laptop', 'mouse', 'remote', 'keyboard',
-    'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'N/A',
-    'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
-    'toothbrush'
-]
+device = 'cuda:0'
 
 CLASSES = [
     'N/A', 'crop', 'weed'
@@ -53,7 +53,7 @@ def box_cxcywh_to_xyxy(x):
 def rescale_bboxes(out_bbox, size):
     img_w, img_h = size
     b = box_cxcywh_to_xyxy(out_bbox)
-    b = b * torch.tensor([img_w, img_h, img_w, img_h], dtype=torch.float32)
+    b = b * torch.tensor([img_w, img_h, img_w, img_h], dtype=torch.float32, device=device)
     return b
 
 def plot_results(pil_img, prob, boxes):
@@ -156,26 +156,28 @@ def get_args_parser():
     return parser
 
 
-if __name__ == '__attention__':
+if __name__ == '__main__':
     parser = argparse.ArgumentParser('DETR visualize attention maps', parents=[get_args_parser()])
     args = parser.parse_args()
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-
-    model, criterion, postprocessors = build_model(args)
+    model, _, _ = build_model(args)
     model.to(device)
-    checkpoint = torch.load('/netscratch/naeem/phenobench_detr_r50_syn_v6/checkpoint.pth', map_location='cpu')
+    
+    checkpoint = torch.load('/netscratch/naeem/phenobench_detr_r50_real_baseline/checkpoint.pth', map_location='cpu')
+    del checkpoint["model"]["class_embed.weight"]
+    del checkpoint["model"]["class_embed.bias"]
     model.load_state_dict(checkpoint['model'], strict=False)
     model.eval()
 
     im = Image.open('/netscratch/naeem/phenobench/test/images/phenoBench_00172.png')
     # mean-std normalize the input image (batch-size: 1)
-    img = transform(im).unsqueeze(0)
+    img = transform(im).unsqueeze(0).to(device)
     # propagate through the model
     outputs = model(img)
     # keep only predictions with 0.7+ confidence
     probas = outputs['pred_logits'].softmax(-1)[0, :, :-1]
-    keep = probas.max(-1).values > 0.9
+    keep = (probas.max(-1).values > 0.05).cpu()
     # convert boxes from [0; 1] to image scales
     bboxes_scaled = rescale_bboxes(outputs['pred_boxes'][0, keep], im.size)
 
@@ -183,14 +185,14 @@ if __name__ == '__attention__':
     # use lists to store the outputs via up-values
     conv_features, enc_attn_weights, dec_attn_weights = [], [], []
     hooks = [
-        model.backbone[-1].register_forward_hook(
+        model.backbone[-2].register_forward_hook(
             lambda self, input, output: conv_features.append(output)
         ),
         model.transformer.encoder.layers[-1].self_attn.register_forward_hook(
-            lambda self, input, output: enc_attn_weights.append(output)
+            lambda self, input, output: enc_attn_weights.append(output[1])
         ),
         model.transformer.decoder.layers[-1].multihead_attn.register_forward_hook(
-            lambda self, input, output: dec_attn_weights.append(output)
+            lambda self, input, output: dec_attn_weights.append(output[1])
         ),
     ]
 
@@ -202,15 +204,15 @@ if __name__ == '__attention__':
 
     # don't need the list anymore
     conv_features = conv_features[0]
-    enc_attn_weights = enc_attn_weights[0]
-    dec_attn_weights = dec_attn_weights[0]
+    enc_attn_weights = enc_attn_weights[0].cpu()
+    dec_attn_weights = dec_attn_weights[0].cpu()
 
     # get the feature map shape
-    h, w = conv_features.shape[-2:]
+    h, w = conv_features['0'].tensors.shape[-2:]
 
     fig, axs = plt.subplots(ncols=len(bboxes_scaled), nrows=2, figsize=(22, 7))
     colors = COLORS * 100
-    for idx, ax_i, (xmin, ymin, xmax, ymax) in zip(keep.nonzero(), axs.T, bboxes_scaled):
+    for idx, ax_i, (xmin, ymin, xmax, ymax) in zip(keep.nonzero(), axs.T, bboxes_scaled.cpu()):
         ax = ax_i[0]
         ax.imshow(dec_attn_weights[0, idx].view(h, w))
         ax.axis('off')
@@ -220,8 +222,9 @@ if __name__ == '__attention__':
         ax.add_patch(plt.Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
                                 fill=False, color='blue', linewidth=3))
         ax.axis('off')
-        ax.set_title(CLASSES[probas[idx].argmax()])
-    plt.show()
+        # ax.set_title(CLASSES[probas[idx].argmax()])
+        ax.set_title('print')
+    plt.savefig('figure.png')
     fig.tight_layout()
 
     # output of the CNN
@@ -269,5 +272,3 @@ if __name__ == '__attention__':
     #     y = ((y // fact) + 0.5) * fact
     #     fcenter_ax.add_patch(plt.Circle((x * scale, y * scale), fact // 2, color='r'))
     #     fcenter_ax.axis('off')
-
-    main(args)
